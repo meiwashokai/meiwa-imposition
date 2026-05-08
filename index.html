@@ -1,0 +1,939 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>面付け計算ツール</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+</head>
+<body style="margin:0;padding:0;background:#F8FAFC;">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useRef } = React;
+
+// ── 紙サイズ ──────────────────────────────
+const PAPER_SIZES = [
+  { label: "四六判", w: 788, h: 1091 },
+  { label: "菊判",   w: 636, h: 939  },
+  { label: "A列本判", w: 625, h: 880 },
+  { label: "B列本判（JIS）", w: 765, h: 1085 },
+  { label: "ハトロン判", w: 900, h: 1200 },
+  { label: "A0", w: 841,  h: 1189 },
+  { label: "A1", w: 594,  h: 841  },
+  { label: "A2", w: 420,  h: 594  },
+  { label: "A3", w: 297,  h: 420  },
+  { label: "A4", w: 210,  h: 297  },
+  { label: "A5", w: 148,  h: 210  },
+  { label: "B0（JIS）", w: 1030, h: 1456 },
+  { label: "B1（JIS）", w: 728,  h: 1030 },
+  { label: "B2（JIS）", w: 515,  h: 728  },
+  { label: "B3（JIS）", w: 364,  h: 515  },
+  { label: "B4（JIS）", w: 257,  h: 364  },
+  { label: "B5（JIS）", w: 182,  h: 257  },
+  { label: "カスタム",  w: null, h: null  },
+];
+
+// ── 断裁 (cols×rows で全紙を分割) ──────────
+const CUTS = [
+  { label: "全紙",   cols: 1, rows: 1 },
+  { label: "２切",   cols: 2, rows: 1 },
+  { label: "３切",   cols: 3, rows: 1 },
+  { label: "４切",   cols: 2, rows: 2 },
+  { label: "長３切", cols: 1, rows: 3 },
+  { label: "６切",   cols: 3, rows: 2 },
+  { label: "長６切", cols: 2, rows: 3 },
+  { label: "８切",   cols: 4, rows: 2 },
+  { label: "長８切", cols: 2, rows: 4 },
+  { label: "９切",   cols: 3, rows: 3 },
+  { label: "１２切", cols: 4, rows: 3 },
+  { label: "１６切", cols: 4, rows: 4 },
+];
+
+// ── 計算ロジック ──────────────────────────
+function calcImposition({ paperW, paperH, designW, designH, bleed, kuwae, kuwaeJiri, marginLR, gutterH, gutterV }) {
+  const effW = designW + 2 * bleed;
+  const effH = designH + 2 * bleed;
+  const usableW = paperW - 2 * marginLR;
+  const usableH = paperH - kuwae - kuwaeJiri;
+  if (effW <= 0 || effH <= 0 || usableW <= 0 || usableH <= 0) return null;
+
+  const calc = (ew, eh) => {
+    const cols = Math.max(0, Math.floor((usableW + gutterH) / (ew + gutterH)));
+    const rows = Math.max(0, Math.floor((usableH + gutterV) / (eh + gutterV)));
+    const count = cols * rows;
+    const yld = count > 0 ? (count * ew * eh) / (paperW * paperH) * 100 : 0;
+    return { cols, rows, count, yield: yld, effW: ew, effH: eh };
+  };
+
+  return {
+    normal:  calc(effW, effH),
+    rotated: calc(effH, effW),
+    usableW, usableH,
+  };
+}
+
+// ── プレビュー ────────────────────────────
+function LayoutPreview({ paperW, paperH, result, rotated, bleed, kuwae, kuwaeJiri, marginLR, gutterH, gutterV, centerLayout, manualCols, manualRows, showWarning, maxCols, maxRows, svgRef, spareCalc, colGutters, rowGutters, grain }) {
+  const canvasW = 520;
+  const canvasH = 220;
+  const pad = 12;
+  const scale = Math.min((canvasW - pad * 2) / paperW, (canvasH - pad * 2) / paperH);
+  const pw = paperW * scale;
+  const ph = paperH * scale;
+  const ox = pad + (canvasW - pad * 2 - pw) / 2;
+  const oy = pad + (canvasH - pad * 2 - ph) / 2;
+
+  // 紙目ライン（横長表示基準）
+  // タテ目＝繊維が長辺方向＝横長表示では横線
+  // ヨコ目＝繊維が短辺方向＝横長表示では縦線
+  const grainLines = [];
+  const grainSpacing = 12;
+  const grainColor = "#94A3B8";
+  const grainWidth = 0.7;
+  const m = 3;
+  if (grain === "tate") {
+    // タテ目 → 横線（長辺と平行＝水平方向）
+    for (let y = oy + m + grainSpacing; y < oy + ph - m; y += grainSpacing) {
+      grainLines.push(<line key={`g${y}`} x1={ox + m} y1={y} x2={ox + pw - m} y2={y} stroke={grainColor} strokeWidth={grainWidth} opacity={0.6}/>);
+    }
+  } else {
+    // ヨコ目 → 縦線（短辺と平行＝垂直方向）
+    for (let x = ox + m + grainSpacing; x < ox + pw - m; x += grainSpacing) {
+      grainLines.push(<line key={`g${x}`} x1={x} y1={oy + m} x2={x} y2={oy + ph - m} stroke={grainColor} strokeWidth={grainWidth} opacity={0.6}/>);
+    }
+  }
+
+  const mKuwae    = kuwae     * scale; // 下
+  const mKuwaeJ   = kuwaeJiri * scale; // 上
+  const mLR       = marginLR  * scale; // 左右
+
+  const uw = result ? result.usableW * scale : pw - mLR * 2;
+  const uh = result ? result.usableH * scale : ph - mKuwae - mKuwaeJ;
+
+  const noFit = !result || result.count === 0;
+  const base = result ? (rotated ? result.rotated : result.normal) : null;
+
+  // 実際に使う面数（手動指定をクランプ）
+  const cols = base ? Math.min(manualCols, base.cols) : 0;
+  const rows = base ? Math.min(manualRows, base.rows) : 0;
+
+  const cells = [];
+  let spareL = 0, spareR = 0, spareT = 0, spareB = 0;
+
+  if (base && cols > 0 && rows > 0) {
+    const iw = base.effW * scale;
+    const ih = base.effH * scale;
+    const cg = (colGutters && colGutters.length === cols - 1) ? colGutters.map(g => g * scale) : Array(Math.max(0, cols - 1)).fill(gutterH * scale);
+    const rg = (rowGutters && rowGutters.length === rows - 1) ? rowGutters.map(g => g * scale) : Array(Math.max(0, rows - 1)).fill(gutterV * scale);
+    const sumCG = cg.reduce((a, b) => a + b, 0);
+    const sumRG = rg.reduce((a, b) => a + b, 0);
+    const totalW = cols * iw + sumCG;
+    const totalH = rows * ih + sumRG;
+    const spareWpx = uw - totalW;
+    const spareHpx = uh - totalH;
+
+    const offX = spareCalc ? spareCalc.offX * scale : spareWpx / 2;
+    const offY = spareCalc ? spareCalc.offY * scale : (centerLayout ? spareHpx / 2 : spareHpx);
+
+    spareL = spareCalc ? spareCalc.leftMm   : Math.round(offX / scale * 10) / 10;
+    spareR = spareCalc ? spareCalc.rightMm  : Math.round((spareWpx - offX) / scale * 10) / 10;
+    spareT = spareCalc ? spareCalc.topMm    : Math.round(offY / scale * 10) / 10;
+    spareB = spareCalc ? spareCalc.bottomMm : Math.round((spareHpx - offY) / scale * 10) / 10;
+
+    const startX = ox + mLR + offX;
+    const startY = oy + mKuwaeJ + offY;
+
+    // 各列・行のx/y開始位置を累積ガターで計算
+    const colX = [0];
+    for (let c = 0; c < cols - 1; c++) colX.push(colX[c] + iw + cg[c]);
+    const rowY = [0];
+    for (let r = 0; r < rows - 1; r++) rowY.push(rowY[r] + ih + rg[r]);
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        cells.push({ x: startX + colX[c], y: startY + rowY[r], iw, ih });
+      }
+    }
+  }
+
+  const bp = bleed * scale;
+  const spareColor = "#F59E0B";
+  const spareOp = 0.15;
+
+  const mmLabel = (x, y, val) => {
+    if (val === 0) return null;
+    const txt = val + "mm";
+    const w = Math.max(32, txt.length * 7 + 8);
+    return (
+      <g>
+        <rect x={x - w/2} y={y - 8} width={w} height={15} rx={2} fill="white" fillOpacity={0.9}/>
+        <text x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight="600" fill="#92400E">{txt}</text>
+      </g>
+    );
+  };
+
+  // 空きエリア座標
+  const usableX = ox + mLR;
+  const usableY = oy + mKuwaeJ;
+  const cellsLeft   = cells.length > 0 ? cells[0].x : usableX;
+  const cellsTop    = cells.length > 0 ? cells[0].y : usableY;
+  const cellsRight  = cells.length > 0 ? cells[cells.length - 1].x + cells[cells.length - 1].iw : usableX + uw;
+  const cellsBottom = cells.length > 0 ? cells[cells.length - 1].y + cells[cells.length - 1].ih : usableY;
+
+  return (
+    <div>
+      <svg ref={svgRef} width={canvasW} height={canvasH} style={{ display: "block", background: "#fff" }}>
+        <rect x={0} y={0} width={canvasW} height={canvasH} fill="#fff"/>
+        {/* 全紙 */}
+        <rect x={ox} y={oy} width={pw} height={ph} fill="#fff" stroke="#E24B4A" strokeWidth={1.5}/>
+        {/* 左右余白 */}
+        {mLR > 0.5 && <rect x={ox} y={oy} width={mLR} height={ph} fill="#E24B4A" fillOpacity={0.08}/>}
+        {mLR > 0.5 && <rect x={ox + pw - mLR} y={oy} width={mLR} height={ph} fill="#E24B4A" fillOpacity={0.08}/>}
+        {/* クワエ尻（上） */}
+        {mKuwaeJ > 0.5 && <rect x={ox} y={oy} width={pw} height={mKuwaeJ} fill="#94A3B8" fillOpacity={0.15}/>}
+        {/* クワエ（下） */}
+        {mKuwae > 0.5 && <rect x={ox} y={oy + ph - mKuwae} width={pw} height={mKuwae} fill="#E24B4A" fillOpacity={0.12}/>}
+        {/* 有効エリア枠 */}
+        <rect x={usableX} y={usableY} width={uw} height={uh} fill="none" stroke="#CBD5E1" strokeWidth={0.5} strokeDasharray="4 2"/>
+        {/* 紙目ライン（コマの下に表示） */}
+        {grainLines}
+        {/* 空きエリア（オレンジ） */}
+        {cells.length > 0 && spareT * scale > 1 && <rect x={usableX} y={usableY} width={uw} height={spareT * scale} fill={spareColor} fillOpacity={spareOp}/>}
+        {cells.length > 0 && spareB * scale > 1 && <rect x={usableX} y={cellsBottom} width={uw} height={spareB * scale} fill={spareColor} fillOpacity={spareOp}/>}
+        {cells.length > 0 && spareL * scale > 1 && <rect x={usableX} y={cellsTop} width={spareL * scale} height={cellsBottom - cellsTop} fill={spareColor} fillOpacity={spareOp}/>}
+        {cells.length > 0 && spareR * scale > 1 && <rect x={cellsRight} y={cellsTop} width={spareR * scale} height={cellsBottom - cellsTop} fill={spareColor} fillOpacity={spareOp}/>}
+        {/* コマ */}
+        {cells.map((c, i) => {
+          const fw = c.iw - bp * 2, fh = c.ih - bp * 2;
+          return (
+            <g key={i}>
+              {bleed > 0 && <rect x={c.x} y={c.y} width={c.iw} height={c.ih} fill="#E8ECF0" fillOpacity={0.5} stroke="#94A3B8" strokeWidth={0.4} strokeDasharray="2 1"/>}
+              {fw > 0.5 && fh > 0.5 && <rect x={c.x + bp} y={c.y + bp} width={fw} height={fh} fill="#E8ECF0" stroke="#64748B" strokeWidth={0.8}/>}
+              {bleed === 0 && <rect x={c.x} y={c.y} width={c.iw} height={c.ih} fill="#E8ECF0" stroke="#64748B" strokeWidth={0.8}/>}
+            </g>
+          );
+        })}
+        {/* 空きmm表示 */}
+        {cells.length > 0 && spareL > 0 && mmLabel(usableX + spareL * scale / 2, cellsTop + (cellsBottom - cellsTop) / 2, spareL)}
+        {cells.length > 0 && spareR > 0 && mmLabel(cellsRight + spareR * scale / 2, cellsTop + (cellsBottom - cellsTop) / 2, spareR)}
+        {cells.length > 0 && spareT > 0 && mmLabel(usableX + uw / 2, usableY + spareT * scale / 2, spareT)}
+        {cells.length > 0 && spareB > 0 && mmLabel(usableX + uw / 2, cellsBottom + spareB * scale / 2, spareB)}
+        {/* クワエラベル */}
+        {mKuwae > 4 && <text x={ox + pw / 2} y={oy + ph - mKuwae / 2} textAnchor="middle" dominantBaseline="middle" fontSize={10} fill="#991B1B">クワエ {kuwae}mm</text>}
+        {mKuwaeJ > 4 && <text x={ox + pw / 2} y={oy + mKuwaeJ / 2} textAnchor="middle" dominantBaseline="middle" fontSize={10} fill="#475569">クワエ尻 {kuwaeJiri}mm</text>}
+        {noFit && <text x={ox + pw / 2} y={oy + ph / 2} textAnchor="middle" dominantBaseline="middle" fontSize={12} fill="#94A3B8">収まりません</text>}
+        {/* 警告バナー */}
+        {showWarning && (
+          <g>
+            <rect x={0} y={0} width={canvasW} height={28} fill="#FEF2F2" />
+            <rect x={0} y={27} width={canvasW} height={1} fill="#FECACA" />
+            <text x={canvasW / 2} y={14} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight="600" fill="#DC2626">
+              ⚠ 指定面数が紙に収まりません（最大: 横{maxCols} × 縦{maxRows}）に丸めて表示中
+            </text>
+          </g>
+        )}
+      </svg>
+      {/* 空き寸法バッジ */}
+      {cells.length > 0 && (
+        <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 4 }}>
+          {[
+            { label: "左空き", val: spareL },
+            { label: "右空き", val: spareR },
+            { label: "上空き", val: spareT },
+            { label: "下空き", val: spareB },
+          ].map(({ label, val }) => (
+            <div key={label} style={{ background: val > 0 ? "#FEF3C7" : "#F1F5F9", border: `0.5px solid ${val > 0 ? "#FCD34D" : "#E2E8F0"}`, borderRadius: 4, padding: "3px 6px", textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: val > 0 ? "#92400E" : "#94A3B8" }}>{label}</div>
+              <div style={{ fontWeight: 600, fontSize: 12, color: val > 0 ? "#78350F" : "#94A3B8" }}>{val} mm</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── UI部品 ────────────────────────────────
+const SLabel = ({ c }) => <div style={{ fontSize: 11, fontWeight: 600, color: "#64748B", marginBottom: 8, letterSpacing: "0.05em", textTransform: "uppercase" }}>{c}</div>;
+const FLabel = ({ c }) => <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 3 }}>{c}</div>;
+const Card   = ({ children, highlight }) => (
+  <div style={{ background: "#fff", border: highlight ? "2px solid #3B82F6" : "1px solid #E2E8F0", borderRadius: 8, padding: "1rem 1.25rem", position: "relative", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
+    {children}
+  </div>
+);
+
+// ── メインアプリ ──────────────────────────
+function App() {
+  // 紙サイズ
+  const [paperPreset, setPaperPreset]   = useState(0);
+  const [customW,     setCustomW]       = useState(500);
+  const [customH,     setCustomH]       = useState(700);
+  const [grain,       setGrain]         = useState("tate");
+  // 断裁
+  const [cutIdx,      setCutIdx]        = useState(0);
+  // 絵柄
+  const [designW,     setDesignW]       = useState(210);
+  const [designH,     setDesignH]       = useState(297);
+  const [bleed,       setBleed]         = useState(0);
+  const [rotate90,    setRotate90]      = useState(false);
+  // 余白
+  const [kuwae,       setKuwae]         = useState(0);
+  const [kuwaeJiri,   setKuwaeJiri]     = useState(0);
+  const [marginLR,    setMarginLR]      = useState(0);
+  const [gutterH,     setGutterH]       = useState(0);
+  const [gutterV,     setGutterV]       = useState(0);
+  // 付け合わせ
+  const [manualCols,  setManualCols]    = useState(4);
+  const [manualRows,  setManualRows]    = useState(2);
+  const [manualRotated, setManualRotated] = useState(false);
+  const [copies,      setCopies]        = useState(1000);
+  // ガター個別設定
+  const [gutterMode,  setGutterMode]    = useState("uniform"); // "uniform" | "custom"
+  const [customColGutters, setCustomColGutters] = useState([]); // length = clampedCols-1
+  const [customRowGutters, setCustomRowGutters] = useState([]); // length = clampedRows-1
+  const [centerLayout,setCenterLayout]  = useState(false);
+  const [offsetMode,  setOffsetMode]    = useState("auto"); // "auto" | "manual"
+  const [offsetXmm,   setOffsetXmm]     = useState(0);
+  const [offsetYmm,   setOffsetYmm]     = useState(0);
+  const svgRef = useRef(null);
+
+  // 紙サイズ決定（常に横長で計算）
+  const preset  = PAPER_SIZES[paperPreset];
+  const baseW   = preset.w ?? customW;
+  const baseH   = preset.h ?? customH;
+  const grainW  = grain === "tate" ? baseW : baseH;
+  const grainH  = grain === "tate" ? baseH : baseW;
+  const fullW   = Math.max(grainW, grainH);
+  const fullH   = Math.min(grainW, grainH);
+
+  const cut     = CUTS[cutIdx];
+  // 断裁後サイズ（常に横長）
+  const cutRawW = Math.round(fullW / cut.cols);
+  const cutRawH = Math.round(fullH / cut.rows);
+  const paperW  = Math.max(cutRawW, cutRawH);
+  const paperH  = Math.min(cutRawW, cutRawH);
+  // 断裁後に短辺が横になった（縦長→横長に90°回転）場合、紙目方向が反転する
+  const cutRotated = cutRawW < cutRawH;
+  const effectiveGrain = cutRotated
+    ? (grain === "tate" ? "yoko" : "tate")
+    : grain;
+
+  // 絵柄の向き
+  const dW = rotate90 ? designH : designW;
+  const dH = rotate90 ? designW : designH;
+
+  // 計算
+  const result = useMemo(() =>
+    calcImposition({ paperW, paperH, designW: dW, designH: dH, bleed, kuwae, kuwaeJiri, marginLR, gutterH, gutterV }),
+    [paperW, paperH, dW, dH, bleed, kuwae, kuwaeJiri, marginLR, gutterH, gutterV]
+  );
+
+  const bestMode = result && result.normal.count >= result.rotated.count ? "normal" : "rotated";
+
+  // 手動指定のクランプ
+  const manualBase = result ? (manualRotated ? result.rotated : result.normal) : null;
+  const clampedCols = manualBase ? Math.min(manualCols, manualBase.cols) : manualCols;
+  const clampedRows = manualBase ? Math.min(manualRows, manualBase.rows) : manualRows;
+  const manualCount = clampedCols * clampedRows;
+  const manualYield = manualBase && manualCount > 0
+    ? (manualCount * manualBase.effW * manualBase.effH) / (paperW * paperH) * 100
+    : 0;
+
+  // 実際に使うガター配列（均一 or 個別）
+  const nColGaps = Math.max(0, clampedCols - 1);
+  const nRowGaps = Math.max(0, clampedRows - 1);
+  const activeColGutters = useMemo(() => {
+    if (gutterMode === "custom" && customColGutters.length === nColGaps) return customColGutters;
+    return Array(nColGaps).fill(gutterH);
+  }, [gutterMode, customColGutters, nColGaps, gutterH]);
+  const activeRowGutters = useMemo(() => {
+    if (gutterMode === "custom" && customRowGutters.length === nRowGaps) return customRowGutters;
+    return Array(nRowGaps).fill(gutterV);
+  }, [gutterMode, customRowGutters, nRowGaps, gutterV]);
+
+  // 均一モード→カスタムモードへの切り替え時に初期化
+  const switchToCustomGutter = () => {
+    setCustomColGutters(Array(nColGaps).fill(gutterH));
+    setCustomRowGutters(Array(nRowGaps).fill(gutterV));
+    setGutterMode("custom");
+  };
+
+  const updateColGutter = (i, val) => {
+    const arr = [...activeColGutters];
+    arr[i] = Math.max(0, val);
+    setCustomColGutters(arr);
+  };
+  const updateRowGutter = (i, val) => {
+    const arr = [...activeRowGutters];
+    arr[i] = Math.max(0, val);
+    setCustomRowGutters(arr);
+  };
+
+  // 空き計算（プレビュー・エクスポート共用）
+  const spareCalc = useMemo(() => {
+    if (!manualBase || clampedCols === 0 || clampedRows === 0 || !result) return null;
+    const usableW = result.usableW;
+    const usableH = result.usableH;
+    const sumColG = activeColGutters.reduce((a, b) => a + b, 0);
+    const sumRowG = activeRowGutters.reduce((a, b) => a + b, 0);
+    const totalW = clampedCols * manualBase.effW + sumColG;
+    const totalH = clampedRows * manualBase.effH + sumRowG;
+    const spareW = Math.max(0, usableW - totalW);
+    const spareH = Math.max(0, usableH - totalH);
+
+    let offX, offY;
+    if (offsetMode === "manual") {
+      offX = Math.min(Math.max(0, offsetXmm), spareW);
+      offY = Math.min(Math.max(0, offsetYmm), spareH);
+    } else {
+      offX = spareW / 2;
+      offY = centerLayout ? spareH / 2 : spareH;
+    }
+
+    return {
+      offX, offY, spareW, spareH,
+      leftMm:   Math.round(offX * 10) / 10,
+      rightMm:  Math.round((spareW - offX) * 10) / 10,
+      topMm:    Math.round(offY * 10) / 10,
+      bottomMm: Math.round((spareH - offY) * 10) / 10,
+    };
+  }, [manualBase, clampedCols, clampedRows, result, activeColGutters, activeRowGutters, offsetMode, offsetXmm, offsetYmm, centerLayout]);
+
+  // ── エクスポート（Canvasに直接描画） ───────
+  const exportImage = (format) => {
+    const SW = 300;          // 設定値エリア幅
+    const PW = 600, PH = 260; // プレビューエリア
+    const W = SW + PW + 20;
+    const H = PH + 140;
+    const canvas = document.createElement("canvas");
+    canvas.width = W * 2; canvas.height = H * 2; // Retina対応
+    const ctx = canvas.getContext("2d");
+    ctx.scale(2, 2);
+
+    // 背景
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, W, H);
+
+    // ヘッダー
+    ctx.fillStyle = "#0F172A";
+    ctx.font = "bold 15px sans-serif";
+    ctx.fillText("面付け計算結果", 16, 28);
+    ctx.fillStyle = "#94A3B8";
+    ctx.font = "10px sans-serif";
+    ctx.fillText(new Date().toLocaleString("ja-JP"), 16, 44);
+    ctx.strokeStyle = "#E2E8F0";
+    ctx.beginPath(); ctx.moveTo(12, 52); ctx.lineTo(W - 12, 52); ctx.stroke();
+
+    // 設定値テーブル
+    const settingsRows = [
+      ["用紙",       `${preset.label}（${grain === "tate" ? "タテ目" : "ヨコ目"}）`],
+      ["断裁",       `${cut.label} / 断裁後 ${paperW}×${paperH}mm`],
+      ["製品サイズ", `${dW}×${dH}mm${bleed > 0 ? ` / ドブ ${bleed}mm` : ""}`],
+      ["クワエ",     `下${kuwae}mm / 上(クワエ尻)${kuwaeJiri}mm`],
+      ["左右余白",   `${marginLR}mm`],
+      ["送り",       `横${gutterH}mm / 縦${gutterV}mm`],
+      ["面付け",     `横${clampedCols}×縦${clampedRows} = ${manualCount}面（${manualRotated ? "横置き90°" : "縦置き"}）`],
+      ["必要用紙",   `${manualCount > 0 ? Math.ceil(copies / manualCount).toLocaleString() : "―"}枚 / ${copies.toLocaleString()}部`],
+      ["余り",       `${manualCount > 0 ? (Math.ceil(copies / manualCount) * manualCount - copies).toLocaleString() : "―"}部`],
+      ["歩留まり",   `${manualYield.toFixed(1)}%`],
+    ];
+
+    ctx.font = "bold 10px sans-serif"; ctx.fillStyle = "#475569";
+    ctx.fillText("■ 設定値", 16, 68);
+    settingsRows.forEach(([label, val], i) => {
+      const y = 80 + i * 22;
+      ctx.fillStyle = i % 2 === 0 ? "#F8FAFC" : "#fff";
+      ctx.fillRect(12, y - 8, SW - 10, 20);
+      ctx.fillStyle = "#94A3B8"; ctx.font = "9px sans-serif";
+      ctx.fillText(label, 16, y + 5);
+      ctx.fillStyle = "#1E293B"; ctx.font = "10px sans-serif";
+      ctx.fillText(val, 82, y + 5);
+    });
+
+    // 仕切り線
+    ctx.strokeStyle = "#E2E8F0";
+    ctx.beginPath(); ctx.moveTo(SW + 4, 56); ctx.lineTo(SW + 4, H - 12); ctx.stroke();
+
+    // ── プレビュー描画 ──
+    const pad = 10;
+    const ox0 = SW + 14 + pad;
+    const oy0 = 62 + pad;
+    const scale = Math.min((PW - pad * 2) / paperW, (PH - pad * 2) / paperH);
+    const pw = paperW * scale, ph = paperH * scale;
+    const ox = ox0 + (PW - pad * 2 - pw) / 2;
+    const oy = oy0 + (PH - pad * 2 - ph) / 2;
+
+    // 全紙
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(ox, oy, pw, ph);
+    ctx.strokeStyle = "#E24B4A"; ctx.lineWidth = 1.5;
+    ctx.strokeRect(ox, oy, pw, ph);
+
+    const mK = kuwae * scale, mKJ = kuwaeJiri * scale, mLR = marginLR * scale;
+    const uw = (paperW - 2 * marginLR) * scale;
+    const uh = (paperH - kuwae - kuwaeJiri) * scale;
+
+    // クワエ尻（上）
+    if (mKJ > 0) { ctx.fillStyle = "rgba(148,163,184,0.15)"; ctx.fillRect(ox, oy, pw, mKJ); }
+    // クワエ（下）
+    if (mK > 0) { ctx.fillStyle = "rgba(226,75,74,0.12)"; ctx.fillRect(ox, oy + ph - mK, pw, mK); }
+    // 左右余白
+    if (mLR > 0) {
+      ctx.fillStyle = "rgba(226,75,74,0.08)";
+      ctx.fillRect(ox, oy, mLR, ph);
+      ctx.fillRect(ox + pw - mLR, oy, mLR, ph);
+    }
+
+    // コマ配置
+    if (manualBase && clampedCols > 0 && clampedRows > 0) {
+      const iw = manualBase.effW * scale, ih = manualBase.effH * scale;
+      const gH = gutterH * scale, gV = gutterV * scale;
+      const totalW = clampedCols * iw + (clampedCols - 1) * gH;
+      const totalH = clampedRows * ih + (clampedRows - 1) * gV;
+      const spareW = uw - totalW, spareH = uh - totalH;
+      const offX = spareCalc ? spareCalc.offX * scale : totalW > 0 ? (uw - totalW) * scale / 2 : 0;
+      const offY = spareCalc ? spareCalc.offY * scale : totalH > 0 ? (uh - totalH) * scale : 0;
+      const startX = ox + mLR + offX;
+      const startY = oy + mKJ + offY;
+      const bp = bleed * scale;
+
+      // 空きエリア
+      ctx.fillStyle = "rgba(245,158,11,0.15)";
+      if (offY > 0.5) ctx.fillRect(ox + mLR, oy + mKJ, uw, offY);
+      if (spareH - offY > 0.5) ctx.fillRect(ox + mLR, startY + totalH, uw, spareH - offY);
+      if (offX > 0.5) ctx.fillRect(ox + mLR, startY, offX, totalH);
+      if (spareW - offX > 0.5) ctx.fillRect(startX + totalW, startY, spareW - offX, totalH);
+
+      // コマ
+      for (let r = 0; r < clampedRows; r++) {
+        for (let c = 0; c < clampedCols; c++) {
+          const cx = startX + c * (iw + gH);
+          const cy = startY + r * (ih + gV);
+          if (bleed > 0) {
+            ctx.fillStyle = "rgba(232,236,240,0.5)";
+            ctx.fillRect(cx, cy, iw, ih);
+            ctx.strokeStyle = "#94A3B8"; ctx.lineWidth = 0.4;
+            ctx.setLineDash([2, 1]); ctx.strokeRect(cx, cy, iw, ih); ctx.setLineDash([]);
+          }
+          ctx.fillStyle = "#E8ECF0";
+          ctx.fillRect(cx + bp, cy + bp, iw - bp * 2, ih - bp * 2);
+          ctx.strokeStyle = "#64748B"; ctx.lineWidth = 0.8;
+          ctx.strokeRect(cx + bp, cy + bp, iw - bp * 2, ih - bp * 2);
+        }
+      }
+
+      // mm表示（空き）
+      ctx.font = "bold 9px sans-serif"; ctx.fillStyle = "#92400E"; ctx.textAlign = "center";
+      const sL = Math.round(offX / scale * 10) / 10;
+      const sR = Math.round((spareW - offX) / scale * 10) / 10;
+      const sT = Math.round(offY / scale * 10) / 10;
+      const sB = Math.round((spareH - offY) / scale * 10) / 10;
+      const drawMM = (x, y, val) => {
+        if (val <= 0) return;
+        const t = val + "mm";
+        const tw = ctx.measureText(t).width + 8;
+        ctx.fillStyle = "rgba(255,255,255,0.9)";
+        ctx.fillRect(x - tw / 2, y - 7, tw, 13);
+        ctx.fillStyle = "#92400E"; ctx.fillText(t, x, y + 3);
+      };
+      if (sL > 0) drawMM(ox + mLR + offX / 2, startY + totalH / 2, sL);
+      if (sR > 0) drawMM(startX + totalW + (spareW - offX) / 2, startY + totalH / 2, sR);
+      if (sT > 0) drawMM(ox + mLR + uw / 2, oy + mKJ + offY / 2, sT);
+      if (sB > 0) drawMM(ox + mLR + uw / 2, startY + totalH + (spareH - offY) / 2, sB);
+      ctx.textAlign = "left";
+    }
+
+    // プレビュータイトル
+    ctx.fillStyle = "#475569"; ctx.font = "bold 10px sans-serif";
+    ctx.fillText("■ レイアウトプレビュー", SW + 14, 58);
+
+    // 空き凡例
+    const legendY = oy + ph + 14;
+    const legends = [
+      ["#E24B4A", "全紙（赤枠）"],
+      ["rgba(226,75,74,0.2)", "クワエ"],
+      ["#E8ECF0", "仕上がり"],
+      ["rgba(245,158,11,0.3)", "空き"],
+    ];
+    let lx = SW + 14;
+    legends.forEach(([color, label]) => {
+      ctx.fillStyle = color; ctx.strokeStyle = "#94A3B8"; ctx.lineWidth = 0.5;
+      ctx.fillRect(lx, legendY - 7, 10, 10);
+      ctx.strokeRect(lx, legendY - 7, 10, 10);
+      ctx.fillStyle = "#475569"; ctx.font = "9px sans-serif";
+      ctx.fillText(label, lx + 13, legendY + 2);
+      lx += ctx.measureText(label).width + 28;
+    });
+
+    // 出力
+    const dateStr = new Date().toLocaleDateString("ja-JP").replace(/\//g, "-");
+    if (format === "pdf") {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+      s.onload = () => {
+        const { jsPDF } = window.jspdf;
+        const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+        const imgData = canvas.toDataURL("image/png");
+        pdf.addImage(imgData, "PNG", 5, 5, 287, 287 * (H * 2) / (W * 2));
+        pdf.save(`面付け計算_${dateStr}.pdf`);
+      };
+      document.head.appendChild(s);
+    } else {
+      const a = document.createElement("a");
+      a.download = `面付け計算_${dateStr}.${format}`;
+      a.href = canvas.toDataURL(format === "jpeg" ? "image/jpeg" : "image/png", 0.95);
+      a.click();
+    }
+  };
+
+  // UI helpers
+  const inp = (val, set, min = 0, step = 1) => (
+    <input type="number" min={min} step={step} value={val}
+      onChange={e => set(Math.max(min, Number(e.target.value)))}
+      className="imp-input"/>
+  );
+  const rbStyle = active => ({
+    display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer",
+    fontSize: 12, padding: "3px 10px",
+    background: active ? "#EFF6FF" : "#F8FAFC",
+    color: active ? "#1D4ED8" : "#64748B",
+    border: `1.5px solid ${active ? "#93C5FD" : "#E2E8F0"}`,
+    borderRadius: 6, userSelect: "none", fontWeight: active ? 600 : 400,
+  });
+
+  return (
+    <div style={{ fontFamily: "'Noto Sans JP', 'Hiragino Sans', sans-serif", padding: "1.25rem", color: "#1E293B", background: "#F8FAFC", minHeight: "100vh" }}>
+      <style>{`
+        .imp-input, .imp-select {
+          width: 100%; box-sizing: border-box; padding: 7px 10px; font-size: 14px;
+          border: 2px solid #CBD5E1; border-radius: 6px; background: #F8FAFC; color: #1E293B;
+          outline: none; transition: border-color .15s, box-shadow .15s; appearance: auto;
+        }
+        .imp-input:hover, .imp-select:hover { border-color: #94A3B8; background: #F1F5F9; }
+        .imp-input:focus, .imp-select:focus { border-color: #3B82F6; background: #fff; box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
+        .imp-select { cursor: pointer; }
+      `}</style>
+
+      <h2 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 1.25rem", color: "#0F172A" }}>面付け計算ツール</h2>
+
+      <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 16, alignItems: "start" }}>
+
+        {/* ── 左：入力パネル ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+          {/* 製品サイズ */}
+          <Card>
+            <SLabel c="製品サイズ（仕上がり）" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+              <div><FLabel c="幅 (mm)"/>{inp(designW, setDesignW, 1)}</div>
+              <div><FLabel c="高さ (mm)"/>{inp(designH, setDesignH, 1)}</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 12, color: "#475569" }}>
+                <input type="checkbox" checked={rotate90} onChange={e => setRotate90(e.target.checked)} style={{ width: 14, height: 14 }}/>
+                90度回転（{rotate90 ? `${dW}×${dH}mm` : `${designW}×${designH}mm`}→{rotate90 ? `${designW}×${designH}mm` : `${dH}×${dW}mm`}）
+              </label>
+            </div>
+          </Card>
+
+          {/* 紙サイズ */}
+          <Card>
+            <SLabel c="紙サイズ" />
+            <select className="imp-select" value={paperPreset} onChange={e => setPaperPreset(Number(e.target.value))} style={{ marginBottom: 8 }}>
+              {PAPER_SIZES.map((s, i) => <option key={i} value={i}>{s.label}{s.w ? ` ${s.w}×${s.h}mm` : ""}</option>)}
+            </select>
+            {preset.w === null && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+                <div><FLabel c="幅 (mm)"/>{inp(customW, setCustomW, 1)}</div>
+                <div><FLabel c="高さ (mm)"/>{inp(customH, setCustomH, 1)}</div>
+              </div>
+            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+              <span style={{ fontSize: 11, color: "#94A3B8" }}>紙目</span>
+              <label style={rbStyle(grain === "tate")} onClick={() => setGrain("tate")}>タテ目</label>
+              <label style={rbStyle(grain === "yoko")} onClick={() => setGrain("yoko")}>ヨコ目</label>
+              <span style={{ fontSize: 11, color: "#94A3B8", marginLeft: 4 }}>{fullW}×{fullH}mm</span>
+            </div>
+          </Card>
+
+          {/* 断裁 */}
+          <Card>
+            <SLabel c="断裁" />
+            <select className="imp-select" value={cutIdx} onChange={e => setCutIdx(Number(e.target.value))} style={{ marginBottom: 6 }}>
+              {CUTS.map((c, i) => <option key={i} value={i}>{c.label}（{c.cols}×{c.rows}）</option>)}
+            </select>
+            <div style={{ fontSize: 11, color: "#64748B", marginTop: 4 }}>
+              断裁後サイズ：<b>{paperW} × {paperH} mm</b>
+              <span style={{ color: "#94A3B8", marginLeft: 6 }}>（{cut.cols * cut.rows}枚取り）</span>
+            </div>
+          </Card>
+
+          {/* 付け合わせ */}
+          <Card>
+            <SLabel c="付け合わせ" />
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                <label style={rbStyle(!manualRotated)} onClick={() => setManualRotated(false)}>絵柄 縦置き</label>
+                <label style={rbStyle(manualRotated)}  onClick={() => setManualRotated(true)}>絵柄 横置き（90°）</label>
+              </div>
+              <FLabel c="横（列数）× 縦（行数）"/>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                {inp(manualCols, setManualCols, 1)}
+                <span style={{ fontSize: 18, color: "#CBD5E1", textAlign: "center" }}>×</span>
+                {inp(manualRows, setManualRows, 1)}
+              </div>
+              {manualBase && (manualCols > manualBase.cols || manualRows > manualBase.rows) && (
+                <div style={{ fontSize: 11, color: "#E24B4A", padding: "6px 10px", background: "#FFF0F0", borderRadius: 5, marginBottom: 6, lineHeight: 1.6 }}>
+                  ⚠️ 紙に収まりません。自動的に最大値に丸めています。<br/>
+                  <span style={{ color: "#94A3B8" }}>（{manualRotated ? "横置き" : "縦置き"}の最大: 横{manualBase.cols} × 縦{manualBase.rows}）</span>
+                </div>
+              )}
+              <div style={{ marginTop: 10 }}>
+                <FLabel c="ドブ（塗り足し）/ 面 (mm)"/>
+                {inp(bleed, setBleed, 0)}
+                {bleed > 0 && <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 5 }}>断裁込み: {dW + bleed*2} × {dH + bleed*2} mm</div>}
+              </div>
+            </div>
+            <div style={{ borderTop: "1px solid #F1F5F9", paddingTop: 12 }}>
+              <FLabel c="印刷部数（仕上がり枚数）"/>
+              {inp(copies, setCopies, 1)}
+            </div>
+          </Card>
+
+          {/* 余白・送り設定 */}
+          <Card>
+            <SLabel c="余白・送り設定（mm）" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+              <div><FLabel c="クワエ（下部）"/>{inp(kuwae, setKuwae, 0)}</div>
+              <div><FLabel c="クワエ尻（上部）"/>{inp(kuwaeJiri, setKuwaeJiri, 0)}</div>
+              <div><FLabel c="左右余白"/>{inp(marginLR, setMarginLR, 0)}</div>
+              <div></div>
+              <div><FLabel c="送り [←→] 横（均一）"/>{inp(gutterH, setGutterH, 0)}</div>
+              <div><FLabel c="送り [↓↑] 縦（均一）"/>{inp(gutterV, setGutterV, 0)}</div>
+            </div>
+
+            {/* ガター個別設定 */}
+            {(nColGaps > 0 || nRowGaps > 0) && (
+              <div style={{ borderTop: "1px solid #F1F5F9", paddingTop: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <span style={{ fontSize: 11, color: "#64748B", fontWeight: 500 }}>コマ間 個別設定</span>
+                  <label style={rbStyle(gutterMode === "uniform")} onClick={() => setGutterMode("uniform")}>均一</label>
+                  <label style={rbStyle(gutterMode === "custom")} onClick={switchToCustomGutter}>個別</label>
+                </div>
+                {gutterMode === "custom" && (
+                  <div>
+                    {nColGaps > 0 && (
+                      <div style={{ marginBottom: 8 }}>
+                        <FLabel c={`列間（${nColGaps}箇所）mm`}/>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          {activeColGutters.map((g, i) => (
+                            <div key={i} style={{ textAlign: "center" }}>
+                              <div style={{ fontSize: 10, color: "#94A3B8", marginBottom: 2 }}>{i + 1}番目</div>
+                              <input type="number" min={0} step={0.5} value={g}
+                                onChange={e => updateColGutter(i, Number(e.target.value))}
+                                className="imp-input" style={{ width: 64 }}/>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {nRowGaps > 0 && (
+                      <div>
+                        <FLabel c={`行間（${nRowGaps}箇所）mm`}/>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          {activeRowGutters.map((g, i) => (
+                            <div key={i} style={{ textAlign: "center" }}>
+                              <div style={{ fontSize: 10, color: "#94A3B8", marginBottom: 2 }}>{i + 1}番目</div>
+                              <input type="number" min={0} step={0.5} value={g}
+                                onChange={e => updateRowGutter(i, Number(e.target.value))}
+                                className="imp-input" style={{ width: 64 }}/>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {result && (
+              <div style={{ fontSize: 11, color: "#94A3B8", marginTop: 8, paddingTop: 8, borderTop: "1px solid #F1F5F9" }}>
+                有効面積：{result.usableW} × {result.usableH} mm
+              </div>
+            )}
+          </Card>
+        </div>
+
+        {/* ── 右：結果パネル ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+          {result ? (
+            <>
+              {/* 指定面付け結果 */}
+              <Card>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: "#64748B", marginBottom: 2 }}>指定面付け — 絵柄{manualRotated ? "横置き（90°）" : "縦置き"}</div>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+                      <span style={{ fontSize: 36, fontWeight: 700, lineHeight: 1, color: "#0F172A" }}>{manualCount}</span>
+                      <span style={{ fontSize: 16, color: "#64748B" }}>面</span>
+                      <span style={{ fontSize: 14, color: "#475569" }}>横 {clampedCols} × 縦 {clampedRows}</span>
+                      {result && <span style={{ fontSize: 11, color: "#94A3B8" }}>（最大: 横{result.normal.cols} × 縦{result.normal.rows}）</span>}
+                    </div>
+                  </div>
+                  {manualCount > 0 && (
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 11, color: "#64748B", marginBottom: 2 }}>必要用紙</div>
+                      <div>
+                        <span style={{ fontSize: 28, fontWeight: 700 }}>{Math.ceil(copies / manualCount).toLocaleString()}</span>
+                        <span style={{ fontSize: 13, color: "#64748B", marginLeft: 4 }}>枚</span>
+                        <span style={{ fontSize: 11, color: "#94A3B8", marginLeft: 4 }}>/{copies.toLocaleString()}部</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: "#94A3B8" }}>余り {(Math.ceil(copies / manualCount) * manualCount - copies).toLocaleString()}部</div>
+                    </div>
+                  )}
+                </div>
+                <div style={{ height: 5, background: "#F1F5F9", borderRadius: 3, overflow: "hidden", marginBottom: 4 }}>
+                  <div style={{ height: "100%", width: `${Math.min(manualYield, 100).toFixed(1)}%`, background: "#3B82F6", borderRadius: 3 }}/>
+                </div>
+                <div style={{ fontSize: 11, color: "#94A3B8" }}>歩留まり {manualYield.toFixed(1)}%</div>
+              </Card>
+
+              {/* プレビュー */}
+              <Card>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <SLabel c="レイアウトプレビュー"/>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#475569", cursor: "pointer", marginBottom: 8 }}>
+                      <input type="checkbox" checked={centerLayout} onChange={e => setCenterLayout(e.target.checked)} disabled={offsetMode === "manual"} style={{ width: 14, height: 14 }}/>
+                      センターに配置
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                    {[["PNG", "png"], ["JPEG", "jpeg"], ["PDF", "pdf"]].map(([label, fmt]) => (
+                      <button key={fmt} onClick={() => exportImage(fmt)}
+                        style={{ fontSize: 11, padding: "4px 10px", border: "1.5px solid #CBD5E1", borderRadius: 5, background: "#F8FAFC", color: "#475569", cursor: "pointer", fontWeight: 500 }}>
+                        ⬇ {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 空き調整 */}
+                <div style={{ marginBottom: 10, padding: "8px 10px", background: "#F8FAFC", borderRadius: 6, border: "1px solid #E2E8F0" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: offsetMode === "manual" ? 10 : 0 }}>
+                    <span style={{ fontSize: 11, color: "#64748B", fontWeight: 500 }}>空き調整</span>
+                    <label style={rbStyle(offsetMode === "auto")} onClick={() => setOffsetMode("auto")}>自動</label>
+                    <label style={rbStyle(offsetMode === "manual")} onClick={() => setOffsetMode("manual")}>手動</label>
+                  </div>
+                  {offsetMode === "manual" && (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
+                      <div>
+                        <FLabel c="左空き (mm)"/>
+                        <input type="number" min={0} step={0.5} value={offsetXmm}
+                          onChange={e => setOffsetXmm(Math.max(0, Number(e.target.value)))}
+                          className="imp-input"/>
+                        {spareCalc && <div style={{ fontSize: 10, color: "#94A3B8", marginTop: 2 }}>右: {spareCalc.rightMm}mm</div>}
+                      </div>
+                      <div>
+                        <FLabel c="右空き (mm)"/>
+                        <input type="number" min={0} step={0.5} value={spareCalc ? spareCalc.rightMm : 0}
+                          onChange={e => { if (spareCalc) setOffsetXmm(Math.max(0, spareCalc.spareW - Number(e.target.value))); }}
+                          className="imp-input"/>
+                      </div>
+                      <div>
+                        <FLabel c="上空き (mm)"/>
+                        <input type="number" min={0} step={0.5} value={offsetYmm}
+                          onChange={e => setOffsetYmm(Math.max(0, Number(e.target.value)))}
+                          className="imp-input"/>
+                        {spareCalc && <div style={{ fontSize: 10, color: "#94A3B8", marginTop: 2 }}>下: {spareCalc.bottomMm}mm</div>}
+                      </div>
+                      <div>
+                        <FLabel c="下空き (mm)"/>
+                        <input type="number" min={0} step={0.5} value={spareCalc ? spareCalc.bottomMm : 0}
+                          onChange={e => { if (spareCalc) setOffsetYmm(Math.max(0, spareCalc.spareH - Number(e.target.value))); }}
+                          className="imp-input"/>
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div style={{ fontSize: 10, color: "#94A3B8", marginBottom: 8, display: "flex", flexWrap: "wrap", gap: "4px 12px" }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ display: "inline-block", width: 10, height: 10, border: "1.5px solid #E24B4A" }}/>赤枠＝全紙</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    {effectiveGrain === "tate"
+                      ? <svg width={14} height={10}><line x1={0} y1={3} x2={14} y2={3} stroke="#94A3B8" strokeWidth={1}/><line x1={0} y1={7} x2={14} y2={7} stroke="#94A3B8" strokeWidth={1}/></svg>
+                      : <svg width={10} height={14}><line x1={3} y1={0} x2={3} y2={14} stroke="#94A3B8" strokeWidth={1}/><line x1={7} y1={0} x2={7} y2={14} stroke="#94A3B8" strokeWidth={1}/></svg>
+                    }
+                    {effectiveGrain === "tate" ? "タテ目（横線）" : "ヨコ目（縦線）"}
+                  </span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ display: "inline-block", width: 10, height: 10, background: "#E24B4A", opacity: 0.3 }}/>クワエ（下）</span>
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ display: "inline-block", width: 10, height: 10, background: "#E8ECF0", border: "0.5px solid #64748B" }}/>仕上がり</span>
+                  {bleed > 0 && <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ display: "inline-block", width: 10, height: 10, background: "#E8ECF0", opacity: 0.5, border: "0.5px dashed #94A3B8" }}/>塗り足し</span>}
+                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ display: "inline-block", width: 10, height: 10, background: "#F59E0B", opacity: 0.5 }}/>空き</span>
+                </div>
+                <LayoutPreview
+                  paperW={paperW} paperH={paperH}
+                  result={result} rotated={manualRotated}
+                  bleed={bleed} kuwae={kuwae} kuwaeJiri={kuwaeJiri}
+                  marginLR={marginLR} gutterH={gutterH} gutterV={gutterV}
+                  centerLayout={centerLayout}
+                  manualCols={clampedCols} manualRows={clampedRows}
+                  showWarning={manualBase && (manualCols > manualBase.cols || manualRows > manualBase.rows)}
+                  maxCols={manualBase ? manualBase.cols : 0}
+                  maxRows={manualBase ? manualBase.rows : 0}
+                  svgRef={svgRef}
+                  spareCalc={spareCalc}
+                  colGutters={activeColGutters}
+                  rowGutters={activeRowGutters}
+                  grain={effectiveGrain}
+                />
+              </Card>
+
+              {/* 自動計算比較テーブル */}
+              <Card>
+                <SLabel c="自動計算（最大面数）比較"/>
+                <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: "left", color: "#94A3B8", fontWeight: 400, paddingBottom: 6, borderBottom: "1px solid #F1F5F9" }}></th>
+                      <th style={{ textAlign: "right", color: "#94A3B8", fontWeight: 400, paddingBottom: 6, borderBottom: "1px solid #F1F5F9" }}>絵柄 縦置き</th>
+                      <th style={{ textAlign: "right", color: "#94A3B8", fontWeight: 400, paddingBottom: 6, borderBottom: "1px solid #F1F5F9" }}>絵柄 横置き（90°）</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      ["面数（最大）", `${result.normal.count}面`, `${result.rotated.count}面`],
+                      ["配列", `横${result.normal.cols}×縦${result.normal.rows}`, `横${result.rotated.cols}×縦${result.rotated.rows}`],
+                      ["歩留まり", `${result.normal.yield.toFixed(1)}%`, `${result.rotated.yield.toFixed(1)}%`],
+                      ["必要用紙", result.normal.count > 0 ? `${Math.ceil(copies / result.normal.count).toLocaleString()}枚` : "―", result.rotated.count > 0 ? `${Math.ceil(copies / result.rotated.count).toLocaleString()}枚` : "―"],
+                      ["余り", result.normal.count > 0 ? `${(Math.ceil(copies / result.normal.count) * result.normal.count - copies).toLocaleString()}部` : "―", result.rotated.count > 0 ? `${(Math.ceil(copies / result.rotated.count) * result.rotated.count - copies).toLocaleString()}部` : "―"],
+                    ].map(([lbl, a, b]) => (
+                      <tr key={lbl}>
+                        <td style={{ color: "#475569", padding: "6px 0", borderBottom: "1px solid #F8FAFC" }}>{lbl}</td>
+                        <td style={{ textAlign: "right", padding: "6px 0", borderBottom: "1px solid #F8FAFC", fontWeight: bestMode === "normal" ? 600 : 400 }}>{a}</td>
+                        <td style={{ textAlign: "right", padding: "6px 0", borderBottom: "1px solid #F8FAFC", fontWeight: bestMode === "rotated" ? 600 : 400 }}>{b}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Card>
+            </>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 200, color: "#94A3B8", fontSize: 13 }}>
+              左の入力を確認してください
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
